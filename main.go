@@ -91,8 +91,8 @@ func main() {
 
 	// --- Users & election setup ---
 	numUsers := 5
-	numCandidates := 8
-	base := int64(numUsers + 1) // base used to encode votes = numUsers + 1
+	// numCandidates := 8
+	// base := int64(numUsers + 1) // base used to encode votes = numUsers + 1
 
 	// generate users with keys
 	GenerateUsers(pp, int(Lval), numUsers)
@@ -118,7 +118,7 @@ func main() {
 		vf := big.NewInt(7)
 
 		// compute blinded vote: v_i = base^(candidate-1), then apply blinding r - sum(shares)
-		bi := ElGamal.ComputeBlindVotes(candidate, users[ID].r, base, users[ID].Shares, pp, app)
+		bi := ElGamal.ComputeBlindVotes(candidate, users[ID].r, users[ID].Shares, pp, app)
 
 		// encrypt the blided vote and store in VC
 		c0, c1, _ := ElGamal.AEnc(app, pp, vc.K, vc.Apk, vf, bi)
@@ -129,6 +129,6 @@ func main() {
 	total := ElGamal.TallyVotes(app, pp, K, Tmap, vc.Votes)
 
 	// decode counts and determine winner
-	winner := ElGamal.DetermineWinner(total, base, numCandidates)
-	fmt.Println("\n🏆 The winner of the election is candidate:", winner)
+
+	fmt.Println(total)
 }
