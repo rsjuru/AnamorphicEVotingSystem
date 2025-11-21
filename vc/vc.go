@@ -4,7 +4,6 @@ import (
 	"AnamorphicEVotingSystem/ElGamal"
 	"bytes"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -43,10 +42,62 @@ type User struct {
 func main() {
 	fmt.Println("[VC] Registering with authority...")
 
-	// Register VC with authority
-	resp, err := http.Get(serverURL + "/register_vc")
+	url := fmt.Sprintf("%s/fetch?userID=%s", serverURL, "VC")
+	resp, err := http.Get(url)
+
 	if err != nil {
-		log.Fatalf("Failed to register VC: %v", err)
+		log.Fatalf("Failed to fetch public parameters: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var params struct {
+		A string `json:"A"`
+		P string `json:"P"`
+		Q string `json:"Q"`
+		G string `json:"G"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&params); err != nil {
+		log.Fatalf("Failed to decode parameters: %v", err)
+	}
+
+	A := new(big.Int)
+	P := new(big.Int)
+	Q := new(big.Int)
+	G := new(big.Int)
+	A.SetString(params.A, 10)
+	P.SetString(params.P, 10)
+	Q.SetString(params.Q, 10)
+	G.SetString(params.G, 10)
+
+	// Initialize VC structure
+	vc = &VoteCollector{
+		AskVC:   new(big.Int),
+		ApkVC:   new(big.Int),
+		Tmap:    make(map[string]*big.Int),
+		PP:      ElGamal.Params{},
+		APP:     ElGamal.AParams{},
+		pkA:     new(big.Int),
+		users:   make(map[string]*User),
+		randoms: make(map[string]*big.Int),
+		shares:  make(map[string][]*big.Int),
+	}
+
+	vc.PP = ElGamal.Params{P: P, Q: Q, G: G}
+
+	// 2️⃣ Compute ephemeral values
+	pow, _ := rand.Int(rand.Reader, vc.PP.Q)
+	sessionK := new(big.Int).Exp(A, pow, vc.PP.Q)
+	B := new(big.Int).Exp(vc.PP.G, pow, vc.PP.Q)
+
+	payload := map[string]string{
+		"B": B.String(),
+	}
+
+	buf, _ := json.Marshal(payload)
+	resp, err = http.Post(serverURL+"/register_vc", "application/json", bytes.NewBuffer(buf))
+	if err != nil {
+		log.Fatalf("Failed to register: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -58,13 +109,12 @@ func main() {
 	// Parse authority response
 	var data struct {
 		Status string            `json:"status"`
-		Sk     string            `json:"sk"`
 		Pk     string            `json:"pk"`
-		K      string            `json:"K"`
+		C0sk   string            `json:"c0sk"`
+		C1sk   string            `json:"c1sk"`
+		C0dk   string            `json:"c0dk"`
+		C1dk   string            `json:"c1dk"`
 		Tmap   map[string]string `json:"Tmap"`
-		P      string            `json:"P"`
-		Q      string            `json:"Q"`
-		G      string            `json:"G"`
 		L      int               `json:"L"`
 		S      string            `json:"S"`
 		T      string            `json:"T"`
@@ -75,30 +125,6 @@ func main() {
 		log.Fatalf("Invalid response: %v", err)
 	}
 
-	// Decode VC's K
-	KBytes, err := hex.DecodeString(data.K)
-	if err != nil {
-		log.Fatalf("Failed to decode K: %v", err)
-	}
-
-	// Initialize VC structure
-	vc = &VoteCollector{
-		AskVC:   new(big.Int),
-		ApkVC:   new(big.Int),
-		K:       KBytes,
-		Tmap:    make(map[string]*big.Int),
-		PP:      ElGamal.Params{},
-		APP:     ElGamal.AParams{},
-		pkA:     new(big.Int),
-		users:   make(map[string]*User),
-		randoms: make(map[string]*big.Int),
-		shares:  make(map[string][]*big.Int),
-	}
-
-	// Set VC keys
-	if _, ok := vc.AskVC.SetString(data.Sk, 10); !ok {
-		log.Fatal("Invalid Sk from authority")
-	}
 	if _, ok := vc.ApkVC.SetString(data.Pk, 10); !ok {
 		log.Fatal("Invalid Pk from authority")
 	}
@@ -113,18 +139,25 @@ func main() {
 	}
 
 	// Set ElGamal parameters
-	vc.PP.P = new(big.Int)
-	vc.PP.Q = new(big.Int)
-	vc.PP.G = new(big.Int)
-	vc.PP.P.SetString(data.P, 10)
-	vc.PP.Q.SetString(data.Q, 10)
-	vc.PP.G.SetString(data.G, 10)
-
 	vc.APP.L = data.L
 	vc.APP.S = new(big.Int)
 	vc.APP.T = new(big.Int)
 	vc.APP.S.SetString(data.S, 10)
 	vc.APP.T.SetString(data.T, 10)
+	c0sk := new(big.Int)
+	c1sk := new(big.Int)
+	c0dk := new(big.Int)
+	c1dk := new(big.Int)
+	c0sk.SetString(data.C0sk, 10)
+	c1sk.SetString(data.C1sk, 10)
+	c0dk.SetString(data.C0dk, 10)
+	c1dk.SetString(data.C1dk, 10)
+
+	Ask := ElGamal.Dec(&vc.PP, sessionK, c0sk, c1sk)
+	KInt := ElGamal.Dec(&vc.PP, sessionK, c0dk, c1dk)
+
+	vc.K = KInt.Bytes()
+	vc.AskVC = Ask
 
 	if _, ok := vc.pkA.SetString(data.PkA, 10); !ok {
 		log.Fatal("Invalid pkA from authority")

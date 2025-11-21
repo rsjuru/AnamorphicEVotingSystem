@@ -4,7 +4,6 @@ import (
 	"AnamorphicEVotingSystem/ElGamal"
 	"bytes"
 	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -37,18 +36,63 @@ type User struct {
 var user *User
 
 func main() {
-	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run ./client <userID>")
-		return
-	}
-
 	userID := os.Args[1]
-	fmt.Printf("[User %s] Registering...\n", userID)
 
-	url := fmt.Sprintf("%s/register?userID=%s", serverURL, userID)
+	// 1️⃣ Fetch public parameters
+	url := fmt.Sprintf("%s/fetch?userID=%s", serverURL, userID) // or POST if you prefer
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Fatalf("Failed to contact authority: %v", err)
+		log.Fatalf("Failed to fetch public parameters: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var params struct {
+		A string `json:"A"`
+		P string `json:"P"`
+		Q string `json:"Q"`
+		G string `json:"G"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&params); err != nil {
+		log.Fatalf("Failed to decode parameters: %v", err)
+	}
+
+	A := new(big.Int)
+	P := new(big.Int)
+	Q := new(big.Int)
+	G := new(big.Int)
+	A.SetString(params.A, 10)
+	P.SetString(params.P, 10)
+	Q.SetString(params.Q, 10)
+	G.SetString(params.G, 10)
+
+	user = &User{
+		UserID: userID,
+		Apk:    new(big.Int),
+		Ask:    new(big.Int),
+		Tmap:   make(map[string]*big.Int),
+		pkA:    new(big.Int),
+		ApkVC:  new(big.Int),
+		dkVC:   nil,
+	}
+
+	user.PP = ElGamal.Params{P: P, Q: Q, G: G}
+
+	// 2️⃣ Compute ephemeral values
+	pow, _ := rand.Int(rand.Reader, user.PP.Q)
+	sessionK := new(big.Int).Exp(A, pow, user.PP.Q)
+	B := new(big.Int).Exp(user.PP.G, pow, user.PP.Q)
+
+	// 3️⃣ POST registration
+	payload := map[string]string{
+		"userID": userID,
+		"B":      B.String(),
+	}
+
+	buf, _ := json.Marshal(payload)
+	resp, err = http.Post(serverURL+"/register", "application/json", bytes.NewBuffer(buf))
+	if err != nil {
+		log.Fatalf("Failed to register: %v", err)
 	}
 	defer resp.Body.Close()
 
@@ -61,12 +105,11 @@ func main() {
 		Status string            `json:"status"`
 		UserID string            `json:"userID"`
 		Apk    string            `json:"apk"`
-		Ask    string            `json:"ask"` // ✅ expect secret key
-		K      string            `json:"K"`
+		C0sk   string            `json:"c0sk"`
+		C1sk   string            `json:"c1sk"`
+		C0dk   string            `json:"c0dk"`
+		C1dk   string            `json:"c1dk"`
 		Tmap   map[string]string `json:"Tmap"`
-		P      string            `json:"P"`
-		Q      string            `json:"Q"`
-		G      string            `json:"G"`
 		L      int               `json:"L"`
 		S      string            `json:"S"`
 		T      string            `json:"T"`
@@ -79,24 +122,7 @@ func main() {
 		log.Fatalf("Invalid JSON: %v", err)
 	}
 
-	KBytes, err := hex.DecodeString(data.K)
-	if err != nil {
-		log.Fatalf("Failed to decode K: %v", err)
-	}
-
-	user = &User{
-		UserID: userID,
-		Apk:    new(big.Int),
-		Ask:    new(big.Int),
-		K:      KBytes,
-		Tmap:   make(map[string]*big.Int),
-		pkA:    new(big.Int),
-		ApkVC:  new(big.Int),
-		dkVC:   nil,
-	}
-
 	user.Apk.SetString(data.Apk, 10)
-	user.Ask.SetString(data.Ask, 10)
 
 	user.port = data.Port
 
@@ -110,19 +136,23 @@ func main() {
 	S.SetString(data.S, 10)
 	T := new(big.Int)
 	T.SetString(data.T, 10)
-	P := new(big.Int)
-	Q := new(big.Int)
-	G := new(big.Int)
-	P.SetString(data.P, 10)
-	Q.SetString(data.Q, 10)
-	G.SetString(data.G, 10)
 	user.pkA.SetString(data.PkA, 10)
 	user.ApkVC.SetString(data.ApkVC, 10)
+	c0sk := new(big.Int)
+	c1sk := new(big.Int)
+	c0dk := new(big.Int)
+	c1dk := new(big.Int)
+	c0sk.SetString(data.C0sk, 10)
+	c1sk.SetString(data.C1sk, 10)
+	c0dk.SetString(data.C0dk, 10)
+	c1dk.SetString(data.C1dk, 10)
 
-	pp := ElGamal.Params{P: P, Q: Q, G: G}
+	Ask := ElGamal.Dec(&user.PP, sessionK, c0sk, c1sk)
+	KInt := ElGamal.Dec(&user.PP, sessionK, c0dk, c1dk)
+	user.K = KInt.Bytes()
+	user.Ask = Ask
+
 	app := ElGamal.AParams{L: data.L, S: S, T: T}
-
-	user.PP = pp
 	user.APP = app
 
 	fmt.Printf("[User %s] Registration successful!\n", userID)
@@ -311,9 +341,7 @@ func receiveShares(w http.ResponseWriter, r *http.Request) {
 	// Recovered K-bytes (anamorphic)
 	kBytes := make([]byte, 0)
 	for _, kv := range kvals {
-		if kv.Sign() != 0 { // ignore padded zeros
-			kBytes = append(kBytes, byte(kv.Int64()))
-		}
+		kBytes = append(kBytes, byte(kv.Int64()))
 	}
 
 	// Save them if needed

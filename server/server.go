@@ -3,6 +3,7 @@ package main
 import (
 	"AnamorphicEVotingSystem/ElGamal"
 	"bytes"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,11 +36,13 @@ type Authority struct {
 	VC         *VoteCollector
 	Users      map[string]*User
 	mu         sync.Mutex
+	sessionAs  map[string]*big.Int
 }
 
 var (
-	auth  *Authority
-	users = make(map[string]*User)
+	auth      *Authority
+	users     = make(map[string]*User)
+	sessionAs = make(map[string]*big.Int)
 
 	phase    = "waiting"
 	maxUsers = 5
@@ -53,6 +56,7 @@ func main() {
 	http.HandleFunc("/status", handleStatus)
 	http.HandleFunc("/candidates", handleCandidates)
 	http.HandleFunc("/register_evil", handleEvilRegistration)
+	http.HandleFunc("/fetch", handleFetchParameters)
 
 	fmt.Println("=== Authority setup complete ===")
 	fmt.Println("Listening on http://localhost:8080 ...")
@@ -75,11 +79,35 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		B string `json:"B"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	B := new(big.Int)
+	B.SetString(req.B, 10)
+
+	sessionK := new(big.Int).Exp(B, auth.sessionAs["VC"], auth.PP.Q)
+	sessionpK := new(big.Int).Exp(auth.PP.G, sessionK, auth.PP.P)
+
 	// 1. ElGamal keygen for VC
 	skVC, pkVC, _ := ElGamal.KGen(&auth.PP)
+	c0sk, c1sk, _ := ElGamal.Enc(auth.PP, sessionpK, skVC)
 
 	// 2. Anamorphic keygen for VC
 	K, Tmap, _ := ElGamal.AGen(auth.APP.L, auth.PP, pkVC)
+	KInt := new(big.Int).SetBytes(K)
+	c0dk, c1dk, _ := ElGamal.Enc(auth.PP, sessionpK, KInt)
+
 	vc := &VoteCollector{
 		ApkVC: pkVC,
 		Tmap:  Tmap,
@@ -89,13 +117,12 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 
 	resp := map[string]interface{}{
 		"status": "ok",
-		"sk":     skVC.String(),
 		"pk":     pkVC.String(),
-		"K":      fmt.Sprintf("%x", K),
+		"c0sk":   c0sk.String(),
+		"c1sk":   c1sk.String(),
+		"c0dk":   c0dk.String(),
+		"c1dk":   c1dk.String(),
 		"Tmap":   bigMapToStringMap(Tmap),
-		"P":      auth.PP.P.String(),
-		"Q":      auth.PP.Q.String(),
-		"G":      auth.PP.G.String(),
 		"L":      auth.APP.L,
 		"S":      auth.APP.S.String(),
 		"T":      auth.APP.T.String(),
@@ -145,7 +172,38 @@ func setUpAuthority() {
 		skA:        skA,
 		Candidates: candidates,
 		Users:      users,
+		sessionAs:  sessionAs,
 	}
+}
+
+func handleFetchParameters(w http.ResponseWriter, r *http.Request) {
+	auth.mu.Lock()
+	defer auth.mu.Unlock()
+
+	// Get userID from query
+	userID := r.URL.Query().Get("userID")
+	if userID == "" {
+		http.Error(w, "missing userID", http.StatusBadRequest)
+		return
+	}
+
+	// Optionally: log or use userID for something
+	fmt.Printf("[Authority] %s requested public parameters\n", userID)
+
+	// Generate ephemeral A for this user
+	pow, _ := rand.Int(rand.Reader, auth.PP.Q)
+	A := new(big.Int).Exp(auth.PP.G, pow, auth.PP.Q)
+	auth.sessionAs[userID] = pow
+
+	resp := map[string]string{
+		"A": A.String(),
+		"P": auth.PP.P.String(),
+		"Q": auth.PP.Q.String(),
+		"G": auth.PP.G.String(), // <- was Q before, fixed to G
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
 }
 
 // ---------------- USER REGISTRATION ----------------
@@ -153,7 +211,24 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 	auth.mu.Lock()
 	defer auth.mu.Unlock()
 
-	userID := r.URL.Query().Get("userID")
+	// Expect POST
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Decode JSON payload from client
+	var req struct {
+		UserID string `json:"userID"`
+		B      string `json:"B"`
+	}
+
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	userID := req.UserID
 	if userID == "" {
 		http.Error(w, "missing userID", http.StatusBadRequest)
 		return
@@ -164,11 +239,23 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse B sent by client
+	B := new(big.Int)
+	B.SetString(req.B, 10)
+
+	sessionK := new(big.Int).Exp(B, auth.sessionAs[userID], auth.PP.Q)
+	sessionpK := new(big.Int).Exp(auth.PP.G, sessionK, auth.PP.P)
+
 	// 1. Generate ElGamal-like keypair for user
 	skU, pkU, _ := ElGamal.KGen(&auth.PP)
 
+	c0sk, c1sk, _ := ElGamal.Enc(auth.PP, sessionpK, skU)
+
 	// 2. Generate anamorphic keys for user
 	K, Tmap, _ := ElGamal.AGen(auth.APP.L, auth.PP, pkU)
+	KInt := new(big.Int).SetBytes(K)
+
+	c0dk, c1dk, _ := ElGamal.Enc(auth.PP, sessionpK, KInt)
 
 	// 3. Create and save user entry
 	user := &User{
@@ -251,12 +338,11 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 		"status": "ok",
 		"userID": userID,
 		"apk":    pkU.String(),
-		"ask":    skU.String(), // ✅ include secret key
-		"K":      fmt.Sprintf("%x", K),
+		"c0sk":   c0sk.String(),
+		"c1sk":   c1sk.String(),
+		"c0dk":   c0dk.String(),
+		"c1dk":   c1dk.String(),
 		"Tmap":   bigMapToStringMap(Tmap),
-		"P":      auth.PP.P.String(),
-		"Q":      auth.PP.Q.String(),
-		"G":      auth.PP.G.String(),
 		"L":      auth.APP.L,
 		"S":      auth.APP.S.String(),
 		"T":      auth.APP.T.String(),

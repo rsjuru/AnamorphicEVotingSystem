@@ -49,25 +49,25 @@ func KGen(pp *Params) (sk, pk *big.Int, err error) {
 
 // Encrypts message m under public key pk with random r ∈ [1, q-1]
 // Returns ciphertext (c0, c1, r)
-func Enc(p, q, g, pk, msg *big.Int) (c0, c1, r *big.Int, err error) {
+func Enc(pp Params, pk, msg *big.Int) (c0, c1 *big.Int, err error) {
 	// Random r in [1, q-1]
-	r, err = rand.Int(rand.Reader, q)
+	r, err := rand.Int(rand.Reader, pp.Q)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 	if r.Sign() == 0 {
 		r = big.NewInt(1)
 	}
 
 	// c0 = (msg * pk^r) mod p
-	pkR := new(big.Int).Exp(pk, r, p)
+	pkR := new(big.Int).Exp(pk, r, pp.P)
 	c0 = new(big.Int).Mul(msg, pkR)
-	c0.Mod(c0, p)
+	c0.Mod(c0, pp.P)
 
 	// c1 = g^r mod p
-	c1 = new(big.Int).Exp(g, r, p)
+	c1 = new(big.Int).Exp(pp.G, r, pp.P)
 
-	return c1, c0, r, nil
+	return c0, c1, nil
 }
 
 // Decrypts ciphertext (c0, c1) with secret key sk
@@ -122,29 +122,6 @@ func F(pp Params, K []byte, x, y *big.Int) *big.Int {
 
 	val := new(big.Int).SetBytes(rev)
 	return new(big.Int).Mod(val, pp.P)
-}
-
-// ----------------- d function -----------------
-func d(t, x *big.Int) *big.Int {
-	return new(big.Int).Mod(x, t)
-}
-
-func xorBytes(a, b []byte) []byte {
-	// Pad shorter slice with leading zeros
-	maxLen := len(a)
-	if len(b) > maxLen {
-		maxLen = len(b)
-	}
-	aPadded := make([]byte, maxLen)
-	bPadded := make([]byte, maxLen)
-	copy(aPadded[maxLen-len(a):], a)
-	copy(bPadded[maxLen-len(b):], b)
-
-	out := make([]byte, maxLen)
-	for i := 0; i < maxLen; i++ {
-		out[i] = aPadded[i] ^ bPadded[i]
-	}
-	return out
 }
 
 // ----------------- Anamorphic Key Generation -----------------
