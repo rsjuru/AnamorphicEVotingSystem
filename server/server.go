@@ -13,30 +13,37 @@ import (
 	"sync"
 )
 
+// ----------------------
+// Structs for Authority
+// ----------------------
+
+// Represents a registered voter
 type User struct {
 	UserID    string
-	Apk       *big.Int
+	Apk       *big.Int // user's public key
 	Tmap      map[string]*big.Int
 	HasVoted  bool
 	Successor string
 	Port      int
 }
 
+// VoteCollector stores VC info
 type VoteCollector struct {
 	ApkVC *big.Int
 	Tmap  map[string]*big.Int
 }
 
+// Represents the election authority
 type Authority struct {
-	PP         ElGamal.Params
-	APP        ElGamal.AParams
-	PkA        *big.Int
-	skA        *big.Int
-	Candidates []string
-	VC         *VoteCollector
-	Users      map[string]*User
-	mu         sync.Mutex
-	sessionAs  map[string]*big.Int
+	PP         ElGamal.Params      // ElGamal public params
+	APP        ElGamal.AParams     // Anamorphic params
+	PkA        *big.Int            // authority public key
+	skA        *big.Int            // authority secret key
+	Candidates []string            // list of candidates
+	VC         *VoteCollector      // registered vote collector
+	Users      map[string]*User    // registeres users
+	mu         sync.Mutex          // mutex for concurrent access
+	sessionAs  map[string]*big.Int // emphemeral session keys for users
 }
 
 var (
@@ -44,13 +51,14 @@ var (
 	users     = make(map[string]*User)
 	sessionAs = make(map[string]*big.Int)
 
-	phase    = "waiting"
-	maxUsers = 5
+	phase    = "waiting" // current system phase
+	maxUsers = 10        // max users to wait for before group setup
 )
 
 func main() {
-	setUpAuthority()
+	setUpAuthority() // initialize authority keys, params, candidates
 
+	// HTTP endpoints
 	http.HandleFunc("/register_vc", handleVCRegistration)
 	http.HandleFunc("/register", handleUserRegistration)
 	http.HandleFunc("/status", handleStatus)
@@ -64,16 +72,20 @@ func main() {
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
+// Helper: write JSON response
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(data)
 }
 
 // -------- Handlers --------
+
+// Registers the vote collector
 func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 	auth.mu.Lock()
 	defer auth.mu.Unlock()
 
+	// reject if VC already exists
 	if auth.VC != nil {
 		http.Error(w, "VC already registered", http.StatusBadRequest)
 		return
@@ -84,6 +96,7 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Parse B sent by VC for session key agreement
 	var req struct {
 		B string `json:"B"`
 	}
@@ -96,18 +109,20 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 	B := new(big.Int)
 	B.SetString(req.B, 10)
 
+	// Compute session key
 	sessionK := new(big.Int).Exp(B, auth.sessionAs["VC"], auth.PP.Q)
 	sessionpK := new(big.Int).Exp(auth.PP.G, sessionK, auth.PP.P)
 
-	// 1. ElGamal keygen for VC
+	// ElGamal keygen for VC
 	skVC, pkVC, _ := ElGamal.KGen(&auth.PP)
 	c0sk, c1sk, _ := ElGamal.Enc(auth.PP, sessionpK, skVC)
 
-	// 2. Anamorphic keygen for VC
+	// Anamorphic keygen for VC
 	K, Tmap, _ := ElGamal.AGen(auth.APP.L, auth.PP, pkVC)
 	KInt := new(big.Int).SetBytes(K)
 	c0dk, c1dk, _ := ElGamal.Enc(auth.PP, sessionpK, KInt)
 
+	// Save VC info
 	vc := &VoteCollector{
 		ApkVC: pkVC,
 		Tmap:  Tmap,
@@ -115,6 +130,7 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 
 	auth.VC = vc
 
+	// Respond with VC keys and shares
 	resp := map[string]interface{}{
 		"status": "ok",
 		"pk":     pkVC.String(),
@@ -133,6 +149,7 @@ func handleVCRegistration(w http.ResponseWriter, r *http.Request) {
 	fmt.Println("[Authority] VC registered successfully.")
 }
 
+// ---------------------- Authority Setup ----------------------
 func setUpAuthority() {
 	// ElGamal system parameters
 	P := new(big.Int)
@@ -146,17 +163,20 @@ func setUpAuthority() {
 	G := big.NewInt(5)
 	pp := ElGamal.Params{P: P, Q: Q, G: G}
 
+	// Generate authority keypair
 	skA, pkA, err := ElGamal.KGen(&pp)
 	if err != nil {
 		log.Fatalf("KGen (Authority) failed: %v", err)
 	}
 	log.Println("Authority keypair generated.")
 
+	// Anamorphic parameters
 	L := 5000
 	S := big.NewInt(int64(L))
 	T := big.NewInt(int64(L))
-
 	ap := ElGamal.AParams{L: L, S: S, T: T}
+
+	// Candidates: 15 good + 5 evil
 	candidates := make([]string, 0, 20)
 	for i := 1; i <= 15; i++ {
 		candidates = append(candidates, fmt.Sprintf("GoodCandidate%02d", i))
@@ -165,6 +185,7 @@ func setUpAuthority() {
 		candidates = append(candidates, fmt.Sprintf("EvilCandidate%02d", i))
 	}
 
+	// Initialize authority struct
 	auth = &Authority{
 		PP:         pp,
 		APP:        ap,
@@ -173,9 +194,11 @@ func setUpAuthority() {
 		Candidates: candidates,
 		Users:      users,
 		sessionAs:  sessionAs,
+		VC:         nil,
 	}
 }
 
+// ---------------------- Fetch Parameters ----------------------
 func handleFetchParameters(w http.ResponseWriter, r *http.Request) {
 	auth.mu.Lock()
 	defer auth.mu.Unlock()
@@ -187,6 +210,11 @@ func handleFetchParameters(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if _, exists := auth.Users[userID]; exists {
+		http.Error(w, "user already registered", http.StatusBadRequest)
+		return
+	}
+
 	// Optionally: log or use userID for something
 	fmt.Printf("[Authority] %s requested public parameters\n", userID)
 
@@ -195,25 +223,30 @@ func handleFetchParameters(w http.ResponseWriter, r *http.Request) {
 	A := new(big.Int).Exp(auth.PP.G, pow, auth.PP.Q)
 	auth.sessionAs[userID] = pow
 
+	// Respond with public parameters
 	resp := map[string]string{
 		"A": A.String(),
 		"P": auth.PP.P.String(),
 		"Q": auth.PP.Q.String(),
-		"G": auth.PP.G.String(), // <- was Q before, fixed to G
+		"G": auth.PP.G.String(),
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	writeJSON(w, resp)
 }
 
-// ---------------- USER REGISTRATION ----------------
+// ---------------- User Registration ----------------
 func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 	auth.mu.Lock()
 	defer auth.mu.Unlock()
 
-	// Expect POST
+	// Only POST allowed
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if auth.VC == nil {
+		http.Error(w, "cannot register, VC does not exist.", http.StatusBadRequest)
 		return
 	}
 
@@ -246,27 +279,23 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 	sessionK := new(big.Int).Exp(B, auth.sessionAs[userID], auth.PP.Q)
 	sessionpK := new(big.Int).Exp(auth.PP.G, sessionK, auth.PP.P)
 
-	// 1. Generate ElGamal-like keypair for user
+	// Generate ElGamal-like keypair for user
 	skU, pkU, _ := ElGamal.KGen(&auth.PP)
-
 	c0sk, c1sk, _ := ElGamal.Enc(auth.PP, sessionpK, skU)
 
-	// 2. Generate anamorphic keys for user
+	// Generate anamorphic keys for user
 	K, Tmap, _ := ElGamal.AGen(auth.APP.L, auth.PP, pkU)
 	KInt := new(big.Int).SetBytes(K)
-
 	c0dk, c1dk, _ := ElGamal.Enc(auth.PP, sessionpK, KInt)
 
-	// 3. Create and save user entry
+	// Create and save user entry
 	user := &User{
 		UserID: userID,
 		Apk:    pkU,
 		Tmap:   Tmap,
 	}
 	auth.Users[userID] = user
-
 	port := 8100 + len(auth.Users)
-
 	auth.Users[userID].Port = port
 
 	url := "http://localhost:8090/handle_key"
@@ -333,7 +362,7 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[Authority] Sent user %s info to VC", userID)
 	}
 
-	// 4. Prepare JSON response
+	// Prepare JSON response
 	respp := map[string]interface{}{
 		"status": "ok",
 		"userID": userID,
@@ -374,6 +403,8 @@ func handleUserRegistration(w http.ResponseWriter, r *http.Request) {
 }
 
 // ---------------- HELPERS ----------------
+
+// Convert map[string]*big.Int -> map[string]string for JSON
 func bigMapToStringMap(m map[string]*big.Int) map[string]string {
 	smap := make(map[string]string)
 	for k, v := range m {
@@ -382,19 +413,12 @@ func bigMapToStringMap(m map[string]*big.Int) map[string]string {
 	return smap
 }
 
+// Status endpoint
 func handleStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"phase": phase})
 }
 
-// Helper function to convert []*big.Int to []string
-func bigIntSliceToStrings(slice []*big.Int) []string {
-	strs := make([]string, len(slice))
-	for i, bi := range slice {
-		strs[i] = bi.String()
-	}
-	return strs
-}
-
+// Return candidate list
 func handleCandidates(w http.ResponseWriter, r *http.Request) {
 	// Only allow GET
 	if r.Method != http.MethodGet {
@@ -410,10 +434,12 @@ func handleCandidates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, candidates)
 }
 
+// Register the "evil" actor (attacker) and return keys + user info
 func handleEvilRegistration(w http.ResponseWriter, r *http.Request) {
 	auth.mu.Lock()
 	defer auth.mu.Unlock()
 
+	// Generate ElGamal keypair for evil entity
 	sk, pk, _ := ElGamal.KGen(&auth.PP)
 
 	type UserInfo struct {
@@ -421,8 +447,8 @@ func handleEvilRegistration(w http.ResponseWriter, r *http.Request) {
 		Port   int
 	}
 
+	// Form vector for userIDs and correspondig ports
 	vec := make([]UserInfo, 0)
-
 	for _, user := range auth.Users {
 		vec = append(vec, UserInfo{
 			UserID: user.UserID,
@@ -430,6 +456,7 @@ func handleEvilRegistration(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Prepare JSON response
 	type Response struct {
 		Status string     `json:"status"`
 		Sk     string     `json:"sk"`
